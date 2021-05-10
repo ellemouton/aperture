@@ -107,16 +107,35 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authLevel := target.AuthRequired(r)
 	switch {
 	case authLevel.IsOn():
-		if !p.authenticator.Accept(&r.Header, target.Name) {
+		if !p.authenticator.Accept(
+			&r.Header, target.ResourceName(r.URL.Path),
+		) {
+			price, err := target.pricer.GetPrice(
+				r.Context(), r.URL.Path,
+			)
+			if err != nil {
+				prefixLog.Errorf("error getting"+
+					" resource price: %v", err)
+				return
+			}
+
+			// If the price returned is zero, then break out of the
+			// switch statement and allow access to the service.
+			if price == 0 {
+				break
+			}
+
 			prefixLog.Infof("Authentication failed. Sending 402.")
-			p.handlePaymentRequired(w, r, target.Name, target.Price)
+			p.handlePaymentRequired(
+				w, r, target.ResourceName(r.URL.Path), price,
+			)
 			return
 		}
 
 	case authLevel.IsFreebie():
 		// We only need to respect the freebie counter if the user
 		// is not authenticated at all.
-		if !p.authenticator.Accept(&r.Header, target.Name) {
+		if !p.authenticator.Accept(&r.Header, target.ResourceName(r.URL.Path)) {
 			ok, err := target.freebieDb.CanPass(r, remoteIP)
 			if err != nil {
 				prefixLog.Errorf("Error querying freebie db: "+
@@ -128,7 +147,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if !ok {
-				p.handlePaymentRequired(w, r, target.Name, target.Price)
+				price, err := target.pricer.GetPrice(
+					r.Context(), r.URL.Path,
+				)
+				if err != nil {
+					prefixLog.Errorf("error getting"+
+						" resource price: %v", err)
+					return
+				}
+
+				// If the price returned is zero, then break
+				// out of the switch statement and allow access
+				// to the service.
+				if price == 0 {
+					break
+				}
+
+				p.handlePaymentRequired(
+					w, r, target.ResourceName(r.URL.Path),
+					target.Price,
+				)
 				return
 			}
 			_, err = target.freebieDb.TallyFreebie(r, remoteIP)
@@ -179,6 +217,16 @@ func (p *Proxy) UpdateServices(services []*Service) error {
 		// A negative value means to flush immediately after each write
 		// to the client.
 		FlushInterval: -1,
+	}
+
+	return nil
+}
+
+func (p *Proxy) Close() error {
+	for _, s := range p.services {
+		if err := s.pricer.Close(); err != nil {
+			return err
+		}
 	}
 
 	return nil

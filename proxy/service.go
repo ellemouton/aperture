@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/lightninglabs/aperture/pricer"
+
 	"github.com/btcsuite/btcutil"
 	"github.com/lightninglabs/aperture/auth"
 	"github.com/lightninglabs/aperture/freebie"
@@ -84,6 +86,16 @@ type Service struct {
 	// service's endpoint.
 	Price int64 `long:"price" description:"Static LSAT value in satoshis to be used for this service"`
 
+	// UsePricerServer is used to indicate whether or not there is a backend
+	// gPRC server that should be used to query for price information for
+	// this service. If true, then PriceConfig will be used to initialise
+	// the pricer.
+	UsePricerServer bool `long:"usepricerserver" description:"Whether or not a gRPC service is available to use for price data"`
+
+	// PriceConfig is the config options needed for initialising the pricer
+	// if a gPRC server is to be used for price data.
+	PricerConfig pricer.Config `long:"pricerconfig" description:"Configuration for the pricer backend."`
+
 	// AuthWhitelistPaths is an optional list of regular expressions that
 	// are matched against the path of the URL of a request. If the request
 	// URL matches any of those regular expressions, the call is treated as
@@ -93,6 +105,20 @@ type Service struct {
 	AuthWhitelistPaths []string `long:"authwhitelistpaths" description:"List of regular expressions for paths that don't require authentication'"`
 
 	freebieDb freebie.DB
+	pricer    pricer.Pricer
+}
+
+// ResourceName returns the string to be used to identify which resource a
+// macaroon has access to. If the UsePriceServer option is set then the service
+// has further restrictions per resource and so the name will include both the
+// service name and the specific resource name. Otherwise authorisation is only
+// restricted by service name.
+func (s *Service) ResourceName(resourcePath string) string {
+	if s.UsePricerServer {
+		return fmt.Sprintf("%s%s", s.Name, resourcePath)
+	}
+
+	return s.Name
 }
 
 // AuthRequired determines the auth level required for a given request.
@@ -170,6 +196,22 @@ func prepareServices(services []*Service) error {
 			}
 		}
 
+		// If the UsePricerServer option is set then use the provided
+		// PricerConfig options to initialise a gRPC backed pricer
+		// server.
+		if service.UsePricerServer {
+			priceClient, err := pricer.NewGRPCPricer(
+				service.PricerConfig,
+			)
+			if err != nil {
+				return fmt.Errorf("error initializing "+
+					"pricer: %v", err)
+			}
+
+			service.pricer = priceClient
+			continue
+		}
+
 		// Check that the price for the service is not negative and not
 		// more than the maximum amount allowed by lnd. If no price, or
 		// a price of zero satoshis, is set the then default price of 1
@@ -186,6 +228,10 @@ func prepareServices(services []*Service) error {
 			return fmt.Errorf("maximum price exceeded for "+
 				"service %s", service.Name)
 		}
+
+		// Initialise a default pricer where all resources in a server
+		// are given the same price.
+		service.pricer = pricer.NewDefaultPricer(service.Price)
 	}
 	return nil
 }
