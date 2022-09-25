@@ -28,6 +28,10 @@ const (
 	// then we'll allow it up to this burst allowance.
 	DefaultMsgBurstAllowance = 10
 
+	// DefaultStaleTimeout is the time after the last seen activity on a
+	// mailbox stream that it will be torn down.
+	DefaultStaleTimeout = time.Hour
+
 	// DefaultBufSize is the default number of bytes that are read in a
 	// single operation.
 	DefaultBufSize = 4096
@@ -189,7 +193,8 @@ type stream struct {
 
 // newStream creates a new stream independent of any given stream ID.
 func newStream(id streamID, limiter *rate.Limiter,
-	equivAuth func(auth *hashmailrpc.CipherBoxAuth) error) *stream {
+	equivAuth func(auth *hashmailrpc.CipherBoxAuth) error,
+	onStale func() error, staleTimeout time.Duration) *stream {
 
 	// Our stream is actually just a plain io.Pipe. This allows us to avoid
 	// having to do things like rate limiting, etc as we can limit the
@@ -237,6 +242,9 @@ func newStream(id streamID, limiter *rate.Limiter,
 		_ = writeReadPipe.CloseWithError(err)
 	}()
 
+	ticker := time.NewTicker(staleTimeout)
+	defer ticker.Stop()
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -259,12 +267,30 @@ func newStream(id streamID, limiter *rate.Limiter,
 					return
 				}
 				c = append(c, buf[0:numBytes]...)
+
 			}
+			ticker.Reset(staleTimeout)
 
 			select {
 			case s.readBytesChan <- c:
 			case <-s.quit:
 			}
+		}
+	}()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		select {
+		case <-ticker.C:
+			err := onStale()
+			if err != nil {
+				log.Error(err)
+			}
+			return
+		case <-s.quit:
+			return
 		}
 	}()
 
@@ -324,6 +350,8 @@ func (s *stream) RequestWriteStream() (*writeStream, error) {
 type hashMailServerConfig struct {
 	msgRate           time.Duration
 	msgBurstAllowance int
+
+	staleTimeout time.Duration
 }
 
 // hashMailServer is an implementation of the HashMailServer gRPC service that
@@ -349,6 +377,9 @@ func newHashMailServer(cfg hashMailServerConfig) *hashMailServer {
 	}
 	if cfg.msgBurstAllowance == 0 {
 		cfg.msgBurstAllowance = DefaultMsgBurstAllowance
+	}
+	if cfg.staleTimeout == 0 {
+		cfg.staleTimeout = DefaultStaleTimeout
 	}
 
 	return &hashMailServer{
@@ -415,7 +446,9 @@ func (h *hashMailServer) InitStream(
 	freshStream := newStream(
 		streamID, limiter, func(auth *hashmailrpc.CipherBoxAuth) error {
 			return nil
-		},
+		}, func() error {
+			return h.tearDownStaleStream(streamID)
+		}, h.cfg.staleTimeout,
 	)
 
 	h.streams[streamID] = freshStream
@@ -496,6 +529,26 @@ func (h *hashMailServer) TearDownStream(ctx context.Context, streamID []byte,
 
 	mailboxCount.Set(float64(len(h.streams)))
 
+	return nil
+}
+
+func (h *hashMailServer) tearDownStaleStream(id streamID) error {
+	log.Debugf("Tearing down stale HashMail stream: id=%x", id)
+
+	h.Lock()
+	defer h.Unlock()
+
+	stream, ok := h.streams[id]
+	if !ok {
+		return fmt.Errorf("stream not found")
+	}
+
+	if err := stream.tearDown(); err != nil {
+		return err
+	}
+
+	delete(h.streams, id)
+	mailboxCount.Set(float64(len(h.streams)))
 	return nil
 }
 
